@@ -30,16 +30,18 @@ init(State) ->
 
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
-    rebar_api:info("Running cuttlefish schema generator", []),
+    rebar_api:info("Running cuttlefish schema generator......", []),
     Relx = rebar_state:get(State, relx, []),
     CFConf = rebar_state:get(State, cuttlefish, []),
+    rebar_api:info("Cuttlefish conf: ~p",[CFConf]),
 
     ReleaseDir = filename:join(rebar_dir:base_dir(State), "rel"),
     CuttlefishBin = case filelib:is_regular(filename:join([rebar_dir:base_dir(State), "bin", "cuttlefish"])) of
                  true ->
                      filename:join([rebar_dir:base_dir(State), "bin", "cuttlefish"]);
                  false ->
-                     case filelib:wildcard(filename:join(["_build", "*", "bin", "cuttlefish"])) of
+                     case filelib:wildcard(filename:join(["_build", "*", "bin", "cuttlefish"])) ++
+                          filelib:wildcard(filename:join(["_checkouts", "cuttlefish*", "cuttlefish"])) of
                          [C | _] ->
                              C;
                          [] ->
@@ -60,7 +62,7 @@ do(State) ->
     Apps = rebar_state:project_apps(State),
     {ok, Cuttlefish} = rebar_app_utils:find(<<"cuttlefish">>, rebar_state:all_plugin_deps(State)),
 
-    AllSchemas = schemas([Cuttlefish | Deps++Apps]),
+    AllSchemas = schemas([Cuttlefish | Deps++Apps], CFConf),
 
     Overlays1 = case {lists:keyfind(schema_discovery, 1, CFConf),
                       lists:keyfind(overlay, 1, Relx)} of
@@ -81,6 +83,7 @@ do(State) ->
                     false ->
                         Overlays1
                 end,
+    rebar_api:info("Cuttlefish overlays: ~p",[Overlays2]),
     State1 = rebar_state:set(State, relx, lists:keydelete(overlay, 1, Relx) ++
                                  [{sys_config, false},
                                   {vm_args, false},
@@ -89,6 +92,7 @@ do(State) ->
     Res = rebar_relx:do(rlx_prv_release, "release", ?PROVIDER, State1),
     SchemaGlob = filename:join([TargetDir, "share", "schema", "*.schema"]),
     ReleaseSchemas = filelib:wildcard(SchemaGlob),
+    rebar_api:info("Schema Glob: ~p, Target Dir: ~p, Release Schemas: ~p",[SchemaGlob, TargetDir, ReleaseSchemas]),
     case filelib:is_regular(ConfFile) of
         false ->
             case cuttlefish_schema:files(ReleaseSchemas) of
@@ -107,20 +111,40 @@ do(State) ->
 format_error({no_cuttlefish_escript, ProfileDir}) ->
     io_lib:format("No cuttlefish escript found under ~s or ~s", [filename:join(ProfileDir, "bin"),
                                                                 "_build/default/bin"]);
+format_error({no_schema_extension, S}) ->
+    io_lib:format("Cuttlefish schema files must end in '.schema': ~s", [S]);
+
+format_error({invalid_schema_file, S, Reason}) ->
+    io_lib:format("Can't read schema file '~s' (error: ~p)", [S, Reason]);
+
 format_error(Error) ->
     io_lib:format("~p", [Error]).
 
 make_default_file(File, TargetDir, Mappings) ->
     Filename = filename:join([TargetDir, "etc", File]),
     filelib:ensure_dir(Filename),
+    rebar_api:info("cuttlefish_conf:generate_file(~p, \"~s\")", [Mappings, Filename]),
     cuttlefish_conf:generate_file(Mappings, Filename),
     Filename.
 
-schemas(Apps) ->
-    lists:flatmap(fun(App) ->
+schemas(Apps, CFConf) ->
+    ExtraSchemas = proplists:get_value(extra_schemas, CFConf, []),
+    AppSchemas   = lists:flatmap(fun(App) ->
                       Dir = rebar_app_info:dir(App),
                       filelib:wildcard(filename:join([Dir, "{priv,schema}", "*.schema"]))
-                  end, Apps) ++ filelib:wildcard(filename:join(["{priv,schema}", "*.schema"])).
+                   end, Apps),
+    DefaultSchemas = filelib:wildcard(filename:join(["{priv,schema}", "*.schema"])),
+    Schemas = AppSchemas ++ DefaultSchemas ++ ExtraSchemas,
+    %% check schema files exist, and end in .schema:
+    lists:foreach(fun(S) ->
+        filename:extension(S) =:= ".schema" orelse throw({no_schema_extension, S}),
+        case file:read_file_info(S) of
+            {ok, _} -> ok;
+            {error, Reason} -> throw({invalid_schema_file, S, Reason})
+        end
+    end, Schemas),
+    rebar_api:info("Using Cuttlefish Schemas: \n * ~s", [string:join(Schemas, "\n * ")]),
+    Schemas.
 
 overlays(Name, Cuttlefish, Overlays, Schemas) ->
     BinScriptTemplate = filename:join([code:priv_dir(rebar3_cuttlefish), "bin_script"]),
@@ -130,6 +154,7 @@ overlays(Name, Cuttlefish, Overlays, Schemas) ->
     Overlays1 = [ list_to_binary(F) || {_, F, _} <- Overlays],
     SchemaOverlays = [{template, Schema, filename:join(["share", "schema", filename:basename(Schema)])}
                       || Schema <- Schemas, not is_overlay(Schema, Overlays1)],
+    %rebar_api:info("Overlays1: ~p, Schemas: ~p", [Overlays1, Schemas]),
     [{copy, Cuttlefish, "bin/cuttlefish"},
      {mkdir, "share"},
      {mkdir, "share/schema"},
